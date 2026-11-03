@@ -1306,4 +1306,399 @@ namespace Slic3r {
         }
         return res;
     }
+
+    // =========================================================================
+    // REA: SDCP protocol extensions (from Elegoo SatelLite reverse engineering)
+    // =========================================================================
+
+    std::string ElegooLink::make_sdcp_request(int cmd, const std::string& payload_json,
+                                              const std::string& mainboard_id,
+                                              std::string* request_id_out) const
+    {
+        // Canonical SDCP JSON envelope (spec-accurate, SDCP V3.0.0).
+        // From = 0 (SDCP_FROM_PC: Local PC Software over LAN).
+        // TimeStamp = Unix epoch seconds (spec example: 1687069655).
+        // Topic routes the message on the motherboard side.
+        boost::uuids::uuid uuid = boost::uuids::random_generator()();
+        std::string uuid_string = to_string(uuid);
+        if (request_id_out)
+            *request_id_out = uuid_string;
+        auto        now         = std::chrono::system_clock::now();
+        auto        duration    = now.time_since_epoch();
+        auto        seconds     = std::chrono::duration_cast<std::chrono::seconds>(duration).count();
+        std::string timestamp   = std::to_string(seconds);
+
+        std::string json = R"({
+                            "Id":")" + uuid_string + R"(",
+                            "Data":{
+                                "Cmd":)" + std::to_string(cmd) + R"(,
+                                "Data":)" + payload_json + R"(,
+                                "RequestID":")" + uuid_string + R"(",
+                                "MainboardID":")" + mainboard_id + R"(",
+                                "TimeStamp":)" + timestamp + R"(,
+                                "From":)" + std::to_string(SDCP_FROM_PC) + R"(
+                            },
+                            "Topic":"sdcp/request/)" + mainboard_id + R"("
+                        })";
+        return json;
+    }
+
+    bool ElegooLink::parse_sdcp_response(const std::string& json, int cmd,
+                                         std::string& payload_json, std::string& error_message) const
+    {
+        try {
+            pt::ptree          root;
+            std::istringstream is(json);
+            pt::read_json(is, root);
+
+            // Sample response:
+            // {"Id":"...","Data":{"Cmd":0,"Data":{...},"RequestID":"...","MainboardID":"...","TimeStamp":0},"Topic":"sdcp/response/..."}
+            auto data = root.get_child_optional("Data");
+            if (!data) {
+                error_message = "Missing Data envelope";
+                return false;
+            }
+            auto cmd_opt = data->get_optional<int>("Cmd");
+            if (!cmd_opt) {
+                error_message = "Missing Cmd field";
+                return false;
+            }
+            if (cmd != -1 && *cmd_opt != cmd) {
+                error_message = "Command mismatch: expected " + std::to_string(cmd) + ", got " + std::to_string(*cmd_opt);
+                return false;
+            }
+            // Serialize the inner Data back to a JSON string for the caller.
+            std::ostringstream oss;
+            pt::write_json(oss, data->get_child("Data", pt::ptree()), false);
+            payload_json = oss.str();
+            return true;
+        } catch (const std::exception& e) {
+            error_message = std::string("Error parsing SDCP response: ") + e.what();
+            return false;
+        }
+    }
+
+    bool ElegooLink::parse_sdcp_status(const std::string& payload_json, ElegooSDCPStatus& out) const
+    {
+        try {
+            pt::ptree          root;
+            std::istringstream is(payload_json);
+            pt::read_json(is, root);
+
+            // --- Status block (spec: "Status Information", Status object) ---
+            auto status = root.get_child_optional("Status");
+            if (status) {
+                // CurrentStatus is an ARRAY of machine statuses (sdcp_machine_status_t)
+                auto currentStatus = status->get_child_optional("CurrentStatus");
+                if (currentStatus) {
+                    out.currentStatus.clear();
+                    for (auto& item : *currentStatus) {
+                        out.currentStatus.push_back(item.second.get_value<int>());
+                    }
+                }
+                out.previousStatus   = status->get<int>("PreviousStatus", 0);
+                out.printScreen      = status->get<long>("PrintScreen", 0);
+                out.releaseFilm      = status->get<long>("ReleaseFilm", 0);
+                out.tempOfUVLED      = status->get<double>("TempOfUVLED", 0.0);
+                out.timeLapseStatus  = status->get<int>("TimeLapseStatus", 0);
+                out.tempOfBox        = status->get<double>("TempOfBox", 0.0);
+                out.tempTargetBox    = status->get<double>("TempTargetBox", 0.0);
+
+                // --- PrintInfo sub-object (spec: nested inside Status) ---
+                auto printInfo = status->get_child_optional("PrintInfo");
+                if (printInfo) {
+                    out.printInfo.status       = printInfo->get<int>("Status", 0);
+                    out.printInfo.currentLayer = printInfo->get<int>("CurrentLayer", 0);
+                    out.printInfo.totalLayer   = printInfo->get<int>("TotalLayer", 0);
+                    out.printInfo.currentTicks = printInfo->get<long>("CurrentTicks", 0);
+                    out.printInfo.totalTicks   = printInfo->get<long>("TotalTicks", 0);
+                    out.printInfo.filename     = printInfo->get<std::string>("Filename", "");
+                    out.printInfo.errorNumber  = printInfo->get<int>("ErrorNumber", 0);
+                    out.printInfo.taskId       = printInfo->get<std::string>("TaskId", "");
+                }
+            }
+            return true;
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(error) << "ElegooLink::parse_sdcp_status error: " << e.what();
+            return false;
+        }
+    }
+
+    bool ElegooLink::parse_sdcp_attributes(const std::string& payload_json, ElegooSDCPAttributes& out) const
+    {
+        try {
+            pt::ptree          root;
+            std::istringstream is(payload_json);
+            pt::read_json(is, root);
+
+            // --- Attributes block (spec: "Attribute Information", Attributes object) ---
+            auto attrs = root.get_child_optional("Attributes");
+            if (!attrs) {
+                BOOST_LOG_TRIVIAL(error) << "ElegooLink::parse_sdcp_attributes: missing Attributes block";
+                return false;
+            }
+            out.name                       = attrs->get<std::string>("Name", "");
+            out.machineName                = attrs->get<std::string>("MachineName", "");
+            out.brandName                  = attrs->get<std::string>("BrandName", "");
+            out.protocolVersion            = attrs->get<std::string>("ProtocolVersion", "");
+            out.firmwareVersion            = attrs->get<std::string>("FirmwareVersion", "");
+            out.resolution                 = attrs->get<std::string>("Resolution", "");
+            out.xyzSize                    = attrs->get<std::string>("XYZsize", "");
+            out.mainboardIP                = attrs->get<std::string>("MainboardIP", "");
+            out.mainboardID                = attrs->get<std::string>("MainboardID", "");
+            out.numberOfVideoStreamConnected = attrs->get<int>("NumberOfVideoStreamConnected", 0);
+            out.maximumVideoStreamAllowed  = attrs->get<int>("MaximumVideoStreamAllowed", 0);
+            out.networkStatus              = attrs->get<std::string>("NetworkStatus", "");
+            out.usbDiskStatus              = attrs->get<int>("UsbDiskStatus", 0);
+            out.releaseFilmMax             = attrs->get<long>("ReleaseFilmMax", 0);
+            out.tempOfUVLEDMax             = attrs->get<double>("TempOfUVLEDMax", 0.0);
+            out.cameraStatus               = attrs->get<int>("CameraStatus", 0);
+            out.remainingMemory            = attrs->get<long>("RemainingMemory", 0);
+            out.tlpNoCapPos                = attrs->get<double>("TLPNoCapPos", 0.0);
+            out.tlpStartCapPos             = attrs->get<double>("TLPStartCapPos", 0.0);
+            out.tlpInterLayers             = attrs->get<int>("TLPInterLayers", 0);
+
+            // Capabilities is an array of strings (FILE_TRANSFER, PRINT_CONTROL, VIDEO_STREAM)
+            auto capabilities = attrs->get_child_optional("Capabilities");
+            if (capabilities) {
+                out.capabilities.clear();
+                for (auto& item : *capabilities) {
+                    out.capabilities.push_back(item.second.get_value<std::string>());
+                }
+            }
+            // SupportFileType is an array of strings (e.g. CTB)
+            auto supportFileType = attrs->get_child_optional("SupportFileType");
+            if (supportFileType) {
+                out.supportFileType.clear();
+                for (auto& item : *supportFileType) {
+                    out.supportFileType.push_back(item.second.get_value<std::string>());
+                }
+            }
+            // DevicesStatus is a nested object of device self-check statuses
+            auto devicesStatus = attrs->get_child_optional("DevicesStatus");
+            if (devicesStatus) {
+                out.devicesStatus.tempSensorStatusOfUVLED = devicesStatus->get<int>("TempSensorStatusOfUVLED", 0);
+                out.devicesStatus.lcdStatus               = devicesStatus->get<int>("LCDStatus", 0);
+                out.devicesStatus.sgStatus                = devicesStatus->get<int>("SgStatus", 0);
+                out.devicesStatus.zMotorStatus            = devicesStatus->get<int>("ZMotorStatus", 0);
+                out.devicesStatus.rotateMotorStatus       = devicesStatus->get<int>("RotateMotorStatus", 0);
+                out.devicesStatus.releaseFilmState        = devicesStatus->get<int>("RelaseFilmState", 0); // spec's own typo: "RelaseFilmState"
+                out.devicesStatus.xMotorStatus            = devicesStatus->get<int>("XMotorStatus", 0);
+            }
+            return true;
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(error) << "ElegooLink::parse_sdcp_attributes error: " << e.what();
+            return false;
+        }
+    }
+
+    // --- REA: SDCP print control over the WebSocket bridge (spec commands 129-131) ---
+    // Sends one of the print-control commands (Pause 129 / Stop 130 / Continue 131)
+    // and waits for the matching Ack response. Payload is empty for these commands.
+    bool ElegooLink::sdcp_print_control(WebSocketClient& client, int cmd, ErrorFn error_fn) const
+    {
+        bool res = false;
+        try {
+            const std::string jsonString = make_sdcp_request(cmd, "{}");
+            BOOST_LOG_TRIVIAL(info) << "sdcp print control cmd=" << cmd << " request: " << jsonString;
+            client.send(jsonString);
+            // wait up to 30s for the matching Ack response
+            auto start_time = std::chrono::steady_clock::now();
+            do {
+                std::string response = client.receive();
+                if (response.empty())
+                    continue;
+                BOOST_LOG_TRIVIAL(info) << "Received: " << response;
+                std::string payload_json, error_message;
+                if (!parse_sdcp_response(response, cmd, payload_json, error_message)) {
+                    // Not the response for our command yet (status push etc.) — keep waiting.
+                    continue;
+                }
+                pt::ptree          root;
+                std::istringstream is(payload_json);
+                pt::read_json(is, root);
+                auto ack_opt = root.get_optional<int>("Ack");
+                if (!ack_opt) {
+                    BOOST_LOG_TRIVIAL(error) << "sdcp print control cmd=" << cmd << ": Ack not found";
+                    error_fn(_L("Error code not found"));
+                    break;
+                }
+                if (*ack_opt == SDCP_PRINT_CTRL_ACK_OK) {
+                    res = true;
+                } else {
+                    BOOST_LOG_TRIVIAL(error) << "sdcp print control cmd=" << cmd << " failed, ack: " << *ack_opt;
+                    wxString error_message;
+                    switch (*ack_opt) {
+                        case SDCP_PRINT_CTRL_ACK_BUSY:
+                            error_message = _L("The printer is busy, please check the device page and try again.");
+                            break;
+                        default:
+                            error_message = _L("Unknown error");
+                            break;
+                    }
+                    error_message += " " + wxString::Format(_L("Error code: %d"), *ack_opt);
+                    error_fn(error_message);
+                }
+                break;
+            } while (std::chrono::steady_clock::now() - start_time < std::chrono::seconds(30));
+            if (!res && std::chrono::steady_clock::now() - start_time >= std::chrono::seconds(30)) {
+                error_fn(_L("Print control command timeout"));
+            }
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(error) << "sdcp print control error: " << e.what();
+            error_fn(_L("Print control command failed") + "\n" + GUI::from_u8(e.what()));
+            res = false;
+        }
+        return res;
+    }
+
+    bool ElegooLink::sdcp_pause_print(WebSocketClient& client, ErrorFn error_fn) const
+    {
+        return sdcp_print_control(client, SDCP_PAUSE_PRINT, error_fn);
+    }
+
+    bool ElegooLink::sdcp_stop_print(WebSocketClient& client, ErrorFn error_fn) const
+    {
+        return sdcp_print_control(client, SDCP_STOP_PRINT, error_fn);
+    }
+
+    bool ElegooLink::sdcp_continue_print(WebSocketClient& client, ErrorFn error_fn) const
+    {
+        return sdcp_print_control(client, SDCP_CONTINUE_PRINT, error_fn);
+    }
+
+    // --- REA: UDP discovery (spec: broadcast "M99999" to UDP port 3000) ---
+    // The motherboard replies with a JSON object containing Name, MachineName,
+    // MainboardIP, MainboardID, ProtocolVersion and FirmwareVersion.
+    bool ElegooLink::discover_devices(std::vector<std::string>& replies, unsigned timeout_ms) const
+    {
+        replies.clear();
+        boost::asio::io_context ioc;
+        boost::asio::ip::udp::socket socket(ioc);
+        boost::system::error_code ec;
+        socket.open(boost::asio::ip::udp::v4(), ec);
+        if (ec) {
+            BOOST_LOG_TRIVIAL(error) << "ElegooLink::discover_devices: socket open failed: " << ec.message();
+            return false;
+        }
+        socket.set_option(boost::asio::socket_base::broadcast(true), ec);
+        if (ec) {
+            BOOST_LOG_TRIVIAL(error) << "ElegooLink::discover_devices: set broadcast failed: " << ec.message();
+            return false;
+        }
+        socket.bind(boost::asio::ip::udp::endpoint(boost::asio::ip::udp::v4(), 0), ec);
+        if (ec) {
+            BOOST_LOG_TRIVIAL(error) << "ElegooLink::discover_devices: bind failed: " << ec.message();
+            return false;
+        }
+        // Send the discovery magic to the broadcast address on the discovery port.
+        boost::asio::ip::udp::endpoint broadcast_ep(
+            boost::asio::ip::address_v4::broadcast(), SDCP_UDP_DISCOVERY_PORT);
+        socket.send_to(boost::asio::buffer(SDCP_DISCOVERY_MAGIC, strlen(SDCP_DISCOVERY_MAGIC)), broadcast_ep, 0, ec);
+        if (ec) {
+            BOOST_LOG_TRIVIAL(error) << "ElegooLink::discover_devices: send failed: " << ec.message();
+            return false;
+        }
+        // Non-blocking receive loop bounded by the deadline.
+        socket.non_blocking(true);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            char buf[2048];
+            boost::asio::ip::udp::endpoint sender;
+            size_t n = socket.receive_from(boost::asio::buffer(buf), sender, 0, ec);
+            if (!ec && n > 0) {
+                replies.emplace_back(buf, n);
+                BOOST_LOG_TRIVIAL(info) << "ElegooLink::discover_devices: reply from " << sender.address().to_string() << ": " << replies.back();
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        return !replies.empty();
+    }
+
+    // --- REA: HTTP LAN REST endpoints (from Elegoo SatelLite EleNetManager.dll) ---
+
+    bool ElegooLink::http_request_json(const std::string& path, const std::string& body,
+                                       std::string& out_body, wxString& msg) const
+    {
+        const char* name = get_name();
+        bool        res  = false;
+        auto        url  = make_url(path);
+        auto        http = body.empty() ? Http::get(std::move(url)) : Http::post(std::move(url));
+        if (!body.empty()) {
+            http.header("Content-Type", "application/json");
+            http.set_post_body(body);
+        }
+        set_auth(http);
+        http.header("Accept", "application/json");
+        http.on_error([&](std::string body, std::string error, unsigned status) {
+            BOOST_LOG_TRIVIAL(error) << boost::format("%1%: HTTP %2% request to %3% failed: %4%, HTTP %5%") % name % (body.empty() ? "GET" : "POST") % path % error % status;
+            msg = format_error(body, error, status);
+        })
+            .on_complete([&](std::string body, unsigned status) {
+                if (status == 200) {
+                    out_body = body;
+                    res      = true;
+                } else {
+                    msg = format_error(body, _u8L("Request failed"), status);
+                }
+            })
+#ifdef WIN32
+            .ssl_revoke_best_effort(m_ssl_revoke_best_effort)
+#endif
+            .perform_sync();
+        return res;
+    }
+
+    bool ElegooLink::http_get_status(std::string& body, wxString& msg) const
+    {
+        return http_request_json("status", "", body, msg);
+    }
+
+    bool ElegooLink::http_get_file_list(std::string& body, wxString& msg) const
+    {
+        return http_request_json("api/files", "", body, msg);
+    }
+
+    bool ElegooLink::http_get_file_list_internal(std::string& body, wxString& msg) const
+    {
+        return http_request_json("api/files/internal", "", body, msg);
+    }
+
+    bool ElegooLink::http_print_control(const std::string& action, wxString& msg) const
+    {
+        std::string body;
+        return http_request_json("api/print/" + action, "", body, msg);
+    }
+
+    bool ElegooLink::http_print_copy_stop(wxString& msg) const
+    {
+        std::string body;
+        return http_request_json("api/print/copy/stop", "", body, msg);
+    }
+
+    bool ElegooLink::http_get_live_camera(std::string& body, wxString& msg) const
+    {
+        return http_request_json("api/printer/livecamera", "", body, msg);
+    }
+
+    bool ElegooLink::http_get_printer_name(std::string& body, wxString& msg) const
+    {
+        return http_request_json("api/printer/name", "", body, msg);
+    }
+
+    bool ElegooLink::http_get_printer_profile(std::string& body, wxString& msg) const
+    {
+        return http_request_json("api/printer/profile", "", body, msg);
+    }
+
+    bool ElegooLink::http_get_timelapse(std::string& body, wxString& msg) const
+    {
+        return http_request_json("api/printer/timelapse", "", body, msg);
+    }
+
+    bool ElegooLink::http_get_timelapse_list(std::string& body, wxString& msg) const
+    {
+        return http_request_json("api/printer/timelapse/list", "", body, msg);
+    }
     }

@@ -764,6 +764,8 @@ set(SLIC3R_GUI_SOURCES
     Utils/Duet.hpp
     Utils/ElegooLink.cpp
     Utils/ElegooLink.hpp
+    Utils/ElegooSDCPSession.cpp
+    Utils/ElegooSDCPSession.hpp
     Utils/EmbossStyleManager.cpp
     Utils/EmbossStyleManager.hpp
     Utils/ESP3D.cpp
