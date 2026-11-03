@@ -528,6 +528,10 @@ Method: raw WebSocket client (Python) → `ws://192.168.15.13:3030/websocket`, f
 8. **Cmd 259 delete works on hidden files** by their exact stored path (`/local//Name.ext`, note the firmware's double slash) — `Ack:0`, and the storage is reclaimed.
 9. **Print-control commands while idle return `Ack=1`** (busy/invalid-state semantics) for Pause (129) and Stop (130) — correct behaviour; the request/response/Ack loop itself is validated.
 10. **No LAN file-download endpoint exists**: `/download?url=...`, `/api/files` return `404 Not found`; port 80 is closed. REA confirms file *download* is a WAN-only feature (Cmd 160 start / Cmd 161 cancel, requiring `Filename`, `Url`, `TaskID`, `Md5` — the printer pulls from Elegoo Cloud). The slicer is an upload-only peer on the LAN.
+11. **Video stream (Cmd 386) validated**: `{"Enable":1}` → `Ack:0` with `VideoUrl` = `rtsp://{MainboardIP}:554/video` (port 554, path `/video`). The stream is **H.264, 1280x720**.
+12. **The RTSP server rejects TCP-interleaved transport** ("Nonmatching transport in server reply" under `-rtsp_transport tcp`); it serves **RTP/UDP only**. Clients must use UDP (ffmpeg's default) — firewalls that block UDP from the printer will break the feed.
+13. **Stream lifetime appears tied to the SDCP session**: after the WebSocket session that opened the stream disconnects, a disable request on a fresh session returns `Ack=1` and no attributes push reports active streams. Treat "enable → view → disable on the same session" as the correct usage pattern; do not rely on cross-session state.
+14. The spec's `Ack=1` for Cmd 386 ("exceeded maximum simultaneous streaming limit") also appears to serve as the generic "no stream active" response for disable on this firmware.
 
 ### Observed status snapshot
 
