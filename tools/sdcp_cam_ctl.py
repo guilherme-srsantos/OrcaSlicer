@@ -87,6 +87,8 @@ def cmd386(sock, enable, seconds=8):
 
 def main():
     action = sys.argv[1] if len(sys.argv) > 1 else ""
+    if action == "view":
+        return view()
     if action not in ("enable", "disable"):
         print(__doc__)
         sys.exit(2)
@@ -96,9 +98,59 @@ def main():
     if not r:
         print(f"no response to {action}"); sys.exit(1)
     if r.get("Ack") != 0:
-        print(f"Ack={r.get('Ack')} (1=max streams, 2=no camera, 3=unknown)")
+        print(f"Ack={r.get('Ack')} (1=max streams/stuck, 2=no camera, 3=unknown)")
         sys.exit(1)
     print(r.get("VideoUrl") or f"{action} ok")
+
+
+def view():
+    """The app-faithful viewing pattern:
+       open SDCP session -> enable stream -> IMMEDIATELY start the player ->
+       hold the session (periodic Cmd 0 keepalive) -> disable on player exit.
+
+       Connecting to an already-running stream mid-flight can miss the H.264
+       parameter sets and show nothing until the next IDR (or forever, if the
+       camera emits an IDR only at stream start) — the 'static stream' bug."""
+    import subprocess
+    sock = socket.create_connection((HOST, PORT), timeout=5); sock.settimeout(5)
+    ws_handshake(sock)
+    r = cmd386(sock, True)
+    if not r or r.get("Ack") != 0:
+        print(f"enable failed: {r}\n(Ack=1: close other viewers; if it persists, "
+              "the printer's RTSP server may be wedged — power-cycle the printer)")
+        sys.exit(1)
+    url = r.get("VideoUrl")
+    print(f"stream: {url}\n(player: q to quit)")
+    p = subprocess.Popen(["ffplay", "-rtsp_transport", "udp", "-fflags", "nobuffer",
+                          "-flags", "low_delay", "-framedrop",
+                          "-window_title", "Elegoo SatelLite — " + HOST, url],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        while p.poll() is None:
+            time.sleep(15)
+            try:
+                ws_send(sock, envelope(0, "{}").encode())  # Cmd 0 = harmless SDCP keepalive
+                sock.settimeout(1.0)
+                try:
+                    while True:
+                        ws_recv(sock)
+                except socket.timeout:
+                    pass
+                sock.settimeout(5)
+            except Exception as e:
+                print(f"keepalive: {e}")
+                break
+    finally:
+        try:
+            p.terminate(); p.wait(timeout=5)
+        except Exception:
+            pass
+        try:
+            cmd386(sock, False)
+        except Exception:
+            pass
+        sock.close()
+        print("stream disabled, session closed")
 
 
 if __name__ == "__main__":
